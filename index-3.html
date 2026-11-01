@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Подземелье Онлайн</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0b0f;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;color:#ddd}
+  canvas{max-width:100%;max-height:100vh;aspect-ratio:8/5;background:#000;border:2px solid #333;touch-action:none}
+  .hidden{display:none !important}
+  #tpBtn{position:fixed;left:8px;bottom:8px;z-index:5;padding:10px 14px;border:0;border-radius:10px;background:#5b8cff;color:#fff;font-size:15px;cursor:pointer}
+  .overlay{position:fixed;inset:0;z-index:10;background:#0b0b0fee;display:flex;align-items:center;justify-content:center;padding:16px}
+  .box{background:#181b22;border-radius:14px;padding:20px;width:100%;max-width:360px;max-height:90vh;overflow:auto}
+  .box h2{margin:0 0 14px;font-size:22px}
+  .box input{width:100%;box-sizing:border-box;padding:12px;margin-bottom:10px;border-radius:10px;border:1px solid #2a2f3a;background:#0f1115;color:#e8eaf0;font-size:16px}
+  .box button{padding:11px 16px;border:0;border-radius:10px;background:#5b8cff;color:#fff;font-size:15px;cursor:pointer;margin:0 6px 8px 0}
+  .box button.g{background:#2a2f3a}
+  .box button:disabled{opacity:.5}
+  .err{color:#ff6b6b;font-size:14px;min-height:20px;margin-top:4px}
+  .small{color:#8b92a3;font-size:13px;margin:6px 0 10px}
+  .row{display:flex;gap:8px}
+  .pl{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:14px}
+  .pl button{margin:0;padding:6px 10px;font-size:13px}
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="500"></canvas>
+
+<button id="tpBtn" class="hidden">⌖ Телепорт</button>
+
+<!-- Вход -->
+<div id="auth" class="overlay">
+  <div class="box">
+    <h2>⚔️ Подземелье Онлайн</h2>
+    <input id="login" placeholder="Логин (латиница, цифры, _)" autocomplete="username" autocapitalize="off">
+    <input id="pass" type="password" placeholder="Пароль (минимум 6 символов)" autocomplete="current-password">
+    <button id="btnLogin">Войти</button>
+    <button id="btnReg" class="g">Регистрация</button>
+    <div class="err" id="authErr"></div>
+    <div class="small">Новый игрок? Придумай логин и пароль и нажми «Регистрация». Пароль восстановить нельзя, запомни его.</div>
+  </div>
+</div>
+
+<!-- Телепорт -->
+<div id="tpPanel" class="overlay hidden">
+  <div class="box">
+    <h2>⌖ Телепорт</h2>
+    <button id="tpSpawn">🏠 На спавн</button>
+    <button id="tpRand" class="g">🎲 Далеко (случайно)</button>
+    <div class="small">Или введи координаты комнаты:</div>
+    <div class="row">
+      <input id="tpX" type="number" placeholder="X" value="0">
+      <input id="tpY" type="number" placeholder="Y" value="0">
+    </div>
+    <button id="tpGo">Телепортироваться</button>
+    <div class="small">Игроки онлайн:</div>
+    <div id="tpList"></div>
+    <div class="err" id="tpMsg"></div>
+    <button id="tpClose" class="g">Закрыть</button>
+    <button id="btnOut" class="g">Выйти из аккаунта</button>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const auth = firebase.auth(), db = firebase.database();
+const cv = $('c'), ctx = cv.getContext('2d');
+const W = 800, H = 500, M = 40, DW = 34, SEED = 1337;
+const DIRS = [[0,-1,'u','d'],[0,1,'d','u'],[-1,0,'l','r'],[1,0,'r','l']];
+const keys = {}, mouse = {x:0, y:0, down:false};
+
+let state = 'auth', paused = false;
+let uid = null, myName = '', myRef = null, roomQ = null, others = {};
+let room, p, tears = [], ebul = [], enemies = [], msg = '', msgT = 0, frame = 0, lastDeath = null;
+let cleared = new Set(), visited = new Set(), taken = {}, kills = 0, best = 0, dirty = false, registering = false;
+let tpCd = 0;
+
+// ---------- мир: почти бесконечный, строится из координат ----------
+const ITEMS = [
+  {n:'Больше урона!',     f:p => p.dmg += 1.5},
+  {n:'Быстрее стрельба!', f:p => p.delay = Math.max(7, p.delay*0.75)},
+  {n:'Быстрее бег!',      f:p => p.spd += 0.5},
+  {n:'Дальше слёзы!',     f:p => p.range += 25},
+  {n:'Новое сердце!',     f:p => { p.max += 2; p.hp = p.max; }}
+];
+function hash(x, y){
+  let n = Math.imul(x|0, 374761393) ^ Math.imul(y|0, 668265263) ^ Math.imul(SEED, 1442695041);
+  n = Math.imul(n ^ (n>>>13), 1274126177);
+  n ^= n>>>16;
+  return (n>>>0)/4294967296;
+}
+function mulberry(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+function roomInfo(rx, ry){
+  const dist = Math.max(Math.abs(rx), Math.abs(ry));
+  const r = hash(rx, ry);
+  let type = 'normal';
+  if (dist === 0) type = 'spawn';
+  else if (dist >= 4 && r < 0.06) type = 'boss';
+  else if (r < 0.13) type = 'treasure';
+  const rng = mulberry(Math.floor(r*4294967296));
+  return {rx, ry, key:rx+','+ry, type, dist, hue:Math.floor(hash(rx>>2, ry>>2)*360),
+          item:Math.floor(rng()*ITEMS.length), doors:{u:1,d:1,l:1,r:1}, cleared:false, pickups:[]};
+}
+
+// ---------- ввод ----------
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  keys[e.code] = true;
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyR' && state === 'dead') respawn();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+function cpos(e){ const r = cv.getBoundingClientRect(); return {x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height}; }
+cv.addEventListener('mousemove', e => { const c = cpos(e); mouse.x = c.x; mouse.y = c.y; });
+cv.addEventListener('mousedown', e => { const c = cpos(e); mouse.x = c.x; mouse.y = c.y; mouse.down = true; });
+addEventListener('mouseup', () => mouse.down = false);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+const joy = {move:null, aim:null};
+cv.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'touch') return;
+  e.preventDefault();
+  if (state === 'dead'){ respawn(); return; }
+  if (state !== 'play' || paused) return;
+  const c = cpos(e), side = c.x < W/2 ? 'move' : 'aim';
+  if (joy[side]) return;
+  joy[side] = {id:e.pointerId, sx:c.x, sy:c.y, x:c.x, y:c.y};
+  try { cv.setPointerCapture(e.pointerId); } catch(_) {}
+});
+cv.addEventListener('pointermove', e => {
+  for (const s in joy) if (joy[s] && joy[s].id === e.pointerId){ const c = cpos(e); joy[s].x = c.x; joy[s].y = c.y; }
+});
+const endP = e => { for (const s in joy) if (joy[s] && joy[s].id === e.pointerId) joy[s] = null; };
+cv.addEventListener('pointerup', endP);
+cv.addEventListener('pointercancel', endP);
+function stick(s){
+  const j = joy[s]; if (!j) return null;
+  const dx = j.x-j.sx, dy = j.y-j.sy, d = Math.hypot(dx,dy), R = 55;
+  if (d < 8) return {x:0, y:0};
+  const k = Math.min(1, d/R);
+  return {x:dx/d*k, y:dy/d*k};
+}
+
+// ---------- вход и регистрация ----------
+const authMsg = c => ({
+  'auth/email-already-in-use':'Такой логин уже занят',
+  'auth/invalid-credential':'Неверный логин или пароль',
+  'auth/invalid-login-credentials':'Неверный логин или пароль',
+  'auth/wrong-password':'Неверный логин или пароль',
+  'auth/user-not-found':'Неверный логин или пароль',
+  'auth/weak-password':'Слишком простой пароль',
+  'auth/operation-not-allowed':'В Firebase не включён вход по Email/Password',
+  'auth/network-request-failed':'Нет связи с интернетом',
+  'auth/too-many-requests':'Слишком много попыток, подожди немного'
+}[c] || 'Ошибка: ' + c);
+
+async function doAuth(reg){
+  const login = $('login').value.trim(), pass = $('pass').value, err = $('authErr');
+  err.textContent = '';
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(login)){ err.textContent = 'Логин: 3–16 символов, латиница, цифры или _'; return; }
+  if (pass.length < 6){ err.textContent = 'Пароль минимум 6 символов'; return; }
+  $('btnLogin').disabled = $('btnReg').disabled = true;
+  const email = login.toLowerCase() + '@dungeon.game';
+  try {
+    if (reg){
+      registering = true;
+      const c = await auth.createUserWithEmailAndPassword(email, pass);
+      await c.user.updateProfile({displayName: login});
+      registering = false;
+      startGame(auth.currentUser);
+    } else {
+      await auth.signInWithEmailAndPassword(email, pass);
+    }
+  } catch (e){ registering = false; err.textContent = authMsg(e.code); }
+  $('btnLogin').disabled = $('btnReg').disabled = false;
+}
+$('btnLogin').onclick = () => doAuth(false);
+$('btnReg').onclick = () => doAuth(true);
+$('pass').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(false); });
+
+auth.onAuthStateChanged(user => {
+  if (user){ if (!registering) startGame(user); }
+  else stopGame();
+});
+
+// ---------- профиль ----------
+async function startGame(user){
+  if (state === 'play') return;
+  uid = user.uid;
+  myName = user.displayName || (user.email || '').split('@')[0];
+  p = {x:W/2, y:H/2+60, vx:0, vy:0, r:14, hp:6, max:6, spd:3, dmg:3.5, delay:22, range:55, cd:0, inv:0};
+  taken = {}; kills = 0; best = 0;
+  try {
+    const prof = (await db.ref('profiles/'+uid).once('value')).val();
+    if (prof){
+      if (prof.stats) Object.assign(p, prof.stats);
+      taken = prof.taken || {}; kills = prof.kills || 0; best = prof.best || 0;
+      p.hp = p.max;
+    }
+  } catch(e){}
+  cleared = new Set(); visited = new Set(); others = {};
+  myRef = db.ref('players/'+uid);
+  myRef.onDisconnect().remove();
+  $('auth').classList.add('hidden');
+  $('tpBtn').classList.remove('hidden');
+  state = 'play';
+  enterRoom(roomInfo(0,0));
+  say('Добро пожаловать, ' + myName + '!');
+}
+function stopGame(){
+  if (myRef){ myRef.onDisconnect().cancel(); myRef.remove(); myRef = null; }
+  if (roomQ){ roomQ.off(); roomQ = null; }
+  others = {}; uid = null; state = 'auth'; paused = false;
+  $('tpPanel').classList.add('hidden');
+  $('tpBtn').classList.add('hidden');
+  $('auth').classList.remove('hidden');
+  $('pass').value = '';
+}
+function saveProfile(){
+  if (!uid || !p || !dirty) return;
+  dirty = false;
+  db.ref('profiles/'+uid).set({name:myName, stats:{max:p.max, dmg:p.dmg, spd:p.spd, delay:p.delay, range:p.range}, taken, kills, best})
+    .catch(() => { dirty = true; });
+}
+setInterval(saveProfile, 15000);
+addEventListener('visibilitychange', () => { if (document.hidden) saveProfile(); });
+addEventListener('beforeunload', saveProfile);
+
+// ---------- другие игроки (только из той же комнаты) ----------
+let lastSend = 0, lastX = -1, lastY = -1;
+function sendPos(force){
+  if (!myRef || !room) return;
+  const now = performance.now(), x = Math.round(p.x), y = Math.round(p.y);
+  if (!force){
+    if (now-lastSend < 100) return;
+    if (x === lastX && y === lastY && now-lastSend < 2000) return;
+  }
+  lastSend = now; lastX = x; lastY = y;
+  myRef.set({room:room.key, x, y, name:myName}).catch(() => {});
+}
+setInterval(() => { if (state === 'play') sendPos(false); }, 100);
+
+function watchRoom(){
+  if (roomQ) roomQ.off();
+  others = {};
+  roomQ = db.ref('players').orderByChild('room').equalTo(room.key);
+  const set = s => {
+    if (s.key === uid) return;
+    const v = s.val(); if (!v) return;
+    let o = others[s.key];
+    if (!o) o = others[s.key] = {x:v.x, y:v.y};
+    o.tx = v.x; o.ty = v.y; o.name = v.name; o.seen = performance.now();
+  };
+  roomQ.on('child_added', set);
+  roomQ.on('child_changed', set);
+  roomQ.on('child_removed', s => { delete others[s.key]; });
+}
+
+// ---------- комнаты ----------
+function enterRoom(r){
+  room = r;
+  r.cleared = r.type === 'spawn' || r.type === 'treasure' || cleared.has(r.key);
+  if (r.type === 'treasure' && !taken[r.key])
+    r.pickups.push({type:'item', src:'treasure', x:W/2, y:H/2, item:ITEMS[r.item]});
+  tears = []; ebul = []; enemies = [];
+  visited.add(r.key);
+  if (r.dist > best){ best = r.dist; dirty = true; }
+  if (!r.cleared) spawnEnemies(r);
+  sendPos(true);
+  watchRoom();
+}
+
+function spawnEnemies(r){
+  const m = 1 + r.dist*0.12;
+  if (r.type === 'boss'){
+    const hp = Math.round(150*(1 + r.dist*0.08));
+    enemies.push({type:'boss', x:W/2, y:130, r:42, hp, max:hp, t:0, flash:0});
+    return;
+  }
+  const n = 3 + (Math.random()*3|0) + Math.min(4, Math.floor(r.dist/3));
+  for (let i=0; i<n; i++){
+    let x, y, tries = 0;
+    do { x = M+40 + Math.random()*(W-2*M-80); y = M+40 + Math.random()*(H-2*M-80); } while (Math.hypot(x-p.x, y-p.y) < 180 && tries++ < 30);
+    const type = ['walker','shooter','bouncer'][Math.random()*3|0];
+    const e = {type, x, y, r:14, hp:Math.round((type === 'shooter' ? 12 : 10)*m), t:(Math.random()*60|0), flash:0};
+    if (type === 'bouncer'){ e.vx = (Math.random()<.5?-1:1)*(1.6+Math.random()*.8); e.vy = (Math.random()<.5?-1:1)*(1.6+Math.random()*.8); }
+    enemies.push(e);
+  }
+}
+
+function go(d){
+  const D = DIRS.find(a => a[2] === d);
+  enterRoom(roomInfo(room.rx+D[0], room.ry+D[1]));
+  if (d==='l'){ p.x = W-M-p.r-6; p.y = H/2; }
+  if (d==='r'){ p.x = M+p.r+6;   p.y = H/2; }
+  if (d==='u'){ p.y = H-M-p.r-6; p.x = W/2; }
+  if (d==='d'){ p.y = M+p.r+6;   p.x = W/2; }
+  p.vx = p.vy = 0;
+  sendPos(true);
+}
+
+function respawn(){
+  p.hp = p.max; p.inv = 120; p.x = W/2; p.y = H/2+60; p.vx = p.vy = 0;
+  state = 'play';
+  enterRoom(roomInfo(0,0));
+  say('Ты вернулся на спавн');
+}
+
+function shoot(e, dx, dy, spd){ ebul.push({x:e.x, y:e.y, vx:dx*spd, vy:dy*spd, r:6}); }
+const dmgTaken = () => 1 + Math.floor(room.dist/10);
+function hurt(n){ if (p.inv > 0) return; p.hp -= n; p.inv = 60; if (p.hp <= 0){ p.hp = 0; state = 'dead'; saveProfile(); } }
+function say(t){ msg = t; msgT = 150; }
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+
+// ---------- телепорт ----------
+function teleport(rx, ry, free){
+  const left = Math.ceil((tpCd - Date.now())/1000);
+  if (!free && left > 0){ $('tpMsg').textContent = 'Подожди ещё ' + left + ' с'; return; }
+  if (!free) tpCd = Date.now() + 4000;
+  enterRoom(roomInfo(rx, ry));
+  p.x = W/2; p.y = H/2+60; p.vx = p.vy = 0;
+  closeTp();
+  say(room.type === 'spawn' ? 'Спавн' : `Телепорт: ${rx}, ${ry}`);
+}
+function openTp(){
+  paused = true; joy.move = joy.aim = null;
+  $('tpMsg').textContent = '';
+  $('tpPanel').classList.remove('hidden');
+  const list = $('tpList'); list.textContent = 'Загрузка...';
+  db.ref('players').once('value').then(s => {
+    const v = s.val() || {};
+    list.innerHTML = '';
+    let n = 0;
+    for (const id in v){
+      if (id === uid) continue;
+      n++;
+      const [x, y] = String(v[id].room).split(',').map(Number);
+      const row = document.createElement('div'); row.className = 'pl';
+      const name = document.createElement('span'); name.textContent = v[id].name + ' (' + x + ', ' + y + ')';
+      const b = document.createElement('button'); b.textContent = 'К игроку';
+      b.onclick = () => teleport(x, y);
+      row.append(name, b); list.append(row);
+    }
+    if (!n) list.textContent = 'Больше никого нет онлайн';
+  }).catch(() => list.textContent = 'Не удалось загрузить список');
+}
+function closeTp(){ paused = false; $('tpPanel').classList.add('hidden'); }
+$('tpBtn').onclick = openTp;
+$('tpClose').onclick = closeTp;
+$('tpSpawn').onclick = () => teleport(0, 0, true);
+$('tpGo').onclick = () => {
+  const x = Math.max(-1e6, Math.min(1e6, Math.round(+$('tpX').value || 0)));
+  const y = Math.max(-1e6, Math.min(1e6, Math.round(+$('tpY').value || 0)));
+  teleport(x, y);
+};
+$('tpRand').onclick = () => {
+  const d = 15 + Math.random()*60, a = Math.random()*Math.PI*2;
+  teleport(Math.round(Math.cos(a)*d), Math.round(Math.sin(a)*d));
+};
+$('btnOut').onclick = () => { saveProfile(); auth.signOut(); };
+
+// ---------- игровая логика ----------
+function update(){
+  let ix = 0, iy = 0;
+  if (keys.KeyA) ix--; if (keys.KeyD) ix++; if (keys.KeyW) iy--; if (keys.KeyS) iy++;
+  let mx = ix, my = iy;
+  const ms = stick('move');
+  if (ms){ mx = ms.x; my = ms.y; }
+  const l = Math.max(1, Math.hypot(mx, my));
+  p.vx += (mx/l*p.spd - p.vx)*0.25;
+  p.vy += (my/l*p.spd - p.vy)*0.25;
+  p.x += p.vx; p.y += p.vy;
+
+  const open = d => room.doors[d] && room.cleared;
+  let minX = M+p.r, maxX = W-M-p.r, minY = M+p.r, maxY = H-M-p.r;
+  const aX = Math.abs(p.x-W/2) < DW-p.r+8, aY = Math.abs(p.y-H/2) < DW-p.r+8;
+  if (aY && open('l')) minX = -5;
+  if (aY && open('r')) maxX = W+5;
+  if (aX && open('u')) minY = -5;
+  if (aX && open('d')) maxY = H+5;
+  p.x = Math.max(minX, Math.min(maxX, p.x));
+  p.y = Math.max(minY, Math.min(maxY, p.y));
+  if (p.x <= 0 && open('l')) return go('l');
+  if (p.x >= W && open('r')) return go('r');
+  if (p.y <= 0 && open('u')) return go('u');
+  if (p.y >= H && open('d')) return go('d');
+
+  if (p.inv > 0) p.inv--;
+  if (msgT > 0) msgT--;
+
+  let sx = 0, sy = 0;
+  if (keys.ArrowLeft) sx--; if (keys.ArrowRight) sx++; if (keys.ArrowUp) sy--; if (keys.ArrowDown) sy++;
+  const as = stick('aim');
+  if (as && Math.hypot(as.x, as.y) > 0.3){ sx = as.x; sy = as.y; }
+  if (!sx && !sy && mouse.down){
+    const dx = mouse.x-p.x, dy = mouse.y-p.y, d = Math.hypot(dx,dy) || 1;
+    sx = dx/d; sy = dy/d;
+  }
+  p.cd--;
+  if ((sx || sy) && p.cd <= 0){
+    const d = Math.hypot(sx, sy);
+    tears.push({x:p.x, y:p.y, vx:sx/d*6.5+p.vx*0.4, vy:sy/d*6.5+p.vy*0.4, life:p.range, dmg:p.dmg, r:6});
+    p.cd = p.delay;
+  }
+
+  for (const t of tears){
+    t.x += t.vx; t.y += t.vy; t.life--;
+    if (t.life <= 0 || t.x < M || t.x > W-M || t.y < M || t.y > H-M) t.dead = true;
+    for (const e of enemies) if (!t.dead && dist(t,e) < e.r + t.r){ e.hp -= t.dmg; e.flash = 5; t.dead = true; }
+  }
+  tears = tears.filter(t => !t.dead);
+
+  const dmg = dmgTaken();
+  for (const e of enemies){
+    e.t++; if (e.flash > 0) e.flash--;
+    const dx = p.x-e.x, dy = p.y-e.y, d = Math.hypot(dx,dy) || 1;
+    if (e.type === 'walker'){ e.x += dx/d*1.1; e.y += dy/d*1.1; }
+    else if (e.type === 'shooter'){
+      const s = d < 180 ? -1 : d > 280 ? 1 : 0;
+      e.x += dx/d*s*0.9 + (-dy/d)*0.5;
+      e.y += dy/d*s*0.9 + (dx/d)*0.5;
+      if (e.t % 110 === 0) shoot(e, dx/d, dy/d, 3);
+    }
+    else if (e.type === 'bouncer'){
+      e.x += e.vx; e.y += e.vy;
+      if (e.x < M+e.r || e.x > W-M-e.r) e.vx *= -1;
+      if (e.y < M+e.r || e.y > H-M-e.r) e.vy *= -1;
+    }
+    else if (e.type === 'boss'){
+      e.x += dx/d*0.5; e.y += dy/d*0.5;
+      if (e.t % 100 === 0) for (let i=0;i<12;i++){ const a = i/12*Math.PI*2 + e.t*0.01; shoot(e, Math.cos(a), Math.sin(a), 2.5); }
+      if (e.t % 170 === 0) for (let i=-1;i<=1;i++){ const a = Math.atan2(dy,dx) + i*0.25; shoot(e, Math.cos(a), Math.sin(a), 3.4); }
+    }
+    e.x = Math.max(M+e.r, Math.min(W-M-e.r, e.x));
+    e.y = Math.max(M+e.r, Math.min(H-M-e.r, e.y));
+    if (d < e.r + p.r*0.8) hurt(dmg);
+  }
+  const before = enemies.length;
+  for (const e of enemies) if (e.hp <= 0){ lastDeath = {x:e.x, y:e.y}; kills++; dirty = true; }
+  enemies = enemies.filter(e => e.hp > 0);
+  if (before > 0 && enemies.length === 0){
+    room.cleared = true; cleared.add(room.key);
+    if (room.type === 'boss'){
+      room.pickups.push({type:'item', x:W/2, y:H/2, item:ITEMS[Math.random()*ITEMS.length|0]});
+      room.pickups.push({type:'heart', x:W/2-60, y:H/2});
+      say('Босс побеждён!');
+    } else if (Math.random() < 0.3 && lastDeath) room.pickups.push({type:'heart', x:lastDeath.x, y:lastDeath.y});
+    saveProfile();
+  }
+
+  for (const b of ebul){
+    b.x += b.vx; b.y += b.vy;
+    if (b.x < M || b.x > W-M || b.y < M || b.y > H-M) b.dead = true;
+    else if (dist(b,p) < b.r + p.r*0.7){ hurt(dmg); b.dead = true; }
+  }
+  ebul = ebul.filter(b => !b.dead);
+
+  for (const k of room.pickups){
+    if (dist(k,p) < 24){
+      if (k.type === 'heart' && p.hp < p.max){ p.hp = Math.min(p.max, p.hp+2); k.taken = true; }
+      if (k.type === 'item'){
+        k.item.f(p); say(k.item.n); k.taken = true; dirty = true;
+        if (k.src === 'treasure') taken[room.key] = true;
+        saveProfile();
+      }
+    }
+  }
+  room.pickups = room.pickups.filter(k => !k.taken);
+}
+
+// ---------- рисование ----------
+function heart(x, y, full){
+  ctx.font = '26px serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#3a3a44'; ctx.fillText('♥', x, y);
+  if (full > 0){
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x, y-16, full >= 1 ? 30 : 13, 32); ctx.clip();
+    ctx.fillStyle = '#e5334b'; ctx.fillText('♥', x, y);
+    ctx.restore();
+  }
+}
+const nameColor = n => { let h = 0; for (const c of String(n)) h = (h*31 + c.charCodeAt(0)) % 360; return `hsl(${h},70%,60%)`; };
+
+function draw(){
+  if (state === 'auth' || !room){ ctx.fillStyle = '#0b0b0f'; ctx.fillRect(0,0,W,H); return; }
+  const hue = room.type === 'spawn' ? 45 : room.hue;
+  ctx.fillStyle = `hsl(${hue},18%,15%)`; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = `hsl(${hue},16%,25%)`; ctx.fillRect(M,M,W-2*M,H-2*M);
+  ctx.fillStyle = `hsl(${hue},16%,29%)`; ctx.fillRect(M+6,M+6,W-2*M-12,H-2*M-12);
+
+  const rects = {u:[W/2-DW,0,DW*2,M], d:[W/2-DW,H-M,DW*2,M], l:[0,H/2-DW,M,DW*2], r:[W-M,H/2-DW,M,DW*2]};
+  for (const d in rects){
+    ctx.fillStyle = room.cleared ? '#0a0a0d' : '#6a4524';
+    ctx.fillRect(...rects[d]);
+  }
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  if (room.type === 'spawn'){
+    ctx.fillStyle = '#ffd24a'; ctx.font = 'bold 22px system-ui'; ctx.fillText('СПАВН', W/2, H/2-100);
+    ctx.fillStyle = '#ffffff66'; ctx.font = '14px system-ui';
+    ctx.fillText(isTouch ? 'Левая половина экрана — ходить · правая — стрелять' : 'WASD — ходить · стрелки или мышь — стрелять', W/2, H/2-72);
+    ctx.fillText('Чем дальше от спавна — тем опаснее. Кнопка ⌖ — телепорт.', W/2, H/2-52);
+  }
+
+  for (const k of room.pickups){
+    if (k.type === 'heart'){ ctx.font = '26px serif'; ctx.fillStyle = '#e5334b'; ctx.fillText('♥', k.x, k.y+8); }
+    else {
+      ctx.fillStyle = '#555'; ctx.fillRect(k.x-22, k.y+8, 44, 12);
+      ctx.fillStyle = '#ffd24a'; ctx.beginPath(); ctx.arc(k.x, k.y-2, 13, 0, 7); ctx.fill();
+      ctx.fillStyle = '#7a5b00'; ctx.font = 'bold 16px system-ui'; ctx.fillText('★', k.x, k.y+4);
+    }
+  }
+
+  for (const e of enemies){
+    ctx.fillStyle = e.flash > 0 ? '#fff' :
+      e.type === 'walker' ? '#c0392b' : e.type === 'shooter' ? '#8e44ad' : e.type === 'bouncer' ? '#27ae60' : '#7b1e1e';
+    ctx.beginPath();
+    if (e.type === 'shooter') ctx.rect(e.x-e.r, e.y-e.r, e.r*2, e.r*2);
+    else if (e.type === 'bouncer'){ ctx.moveTo(e.x,e.y-e.r-3); ctx.lineTo(e.x+e.r+3,e.y); ctx.lineTo(e.x,e.y+e.r+3); ctx.lineTo(e.x-e.r-3,e.y); ctx.closePath(); }
+    else ctx.arc(e.x, e.y, e.r, 0, 7);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    const o = e.r*0.35, s = e.r*0.18;
+    ctx.beginPath(); ctx.arc(e.x-o, e.y-o*0.4, s, 0, 7); ctx.arc(e.x+o, e.y-o*0.4, s, 0, 7); ctx.fill();
+    if (e.type === 'boss'){
+      ctx.fillStyle = '#222'; ctx.fillRect(W/2-150, H-30, 300, 10);
+      ctx.fillStyle = '#d33'; ctx.fillRect(W/2-150, H-30, 300*Math.max(0,e.hp)/e.max, 10);
+    }
+  }
+
+  ctx.fillStyle = '#e03a3a';
+  for (const b of ebul){ ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill(); }
+  ctx.fillStyle = '#9fd8ff';
+  for (const t of tears){ ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, 7); ctx.fill(); }
+
+  // другие игроки в этой комнате
+  const now = performance.now();
+  let count = 1;
+  for (const id in others){
+    const o = others[id];
+    if (now - o.seen > 10000){ delete others[id]; continue; }
+    o.x += (o.tx - o.x)*0.3; o.y += (o.ty - o.y)*0.3;
+    count++;
+    ctx.fillStyle = nameColor(o.name); ctx.beginPath(); ctx.arc(o.x, o.y, 14, 0, 7); ctx.fill();
+    ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(o.x-5, o.y-2, 2.5, 0, 7); ctx.arc(o.x+5, o.y-2, 2.5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px system-ui'; ctx.textAlign = 'center'; ctx.fillText(o.name || '?', o.x, o.y-22);
+  }
+
+  if (!(p.inv > 0 && frame % 6 < 3)){
+    ctx.fillStyle = '#f1d3b3'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+    ctx.fillStyle = '#222';
+    ctx.beginPath(); ctx.arc(p.x-5, p.y-2, 2.5, 0, 7); ctx.arc(p.x+5, p.y-2, 2.5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#9fd8ff'; ctx.beginPath(); ctx.arc(p.x-5, p.y+4, 1.5, 0, 7); ctx.arc(p.x+5, p.y+4, 1.5, 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = '#ffffffcc'; ctx.font = '13px system-ui'; ctx.textAlign = 'center'; ctx.fillText(myName, p.x, p.y-22);
+
+  // HUD
+  for (let i = 0; i < p.max/2; i++) heart(14+i*28, 22, Math.max(0, Math.min(2, p.hp-i*2))/2);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.font = '12px system-ui'; ctx.fillStyle = '#ffffffaa';
+  ctx.fillText(`урон ${p.dmg.toFixed(1)} · скор. ${p.spd.toFixed(1)} · дальн. ${p.range} · убито ${kills}`, 14, H-12);
+  ctx.textAlign = 'right';
+  ctx.fillText(`в комнате: ${count}  ·  рекорд удаления: ${best}`, W-14, H-12);
+
+  // миникарта (7x7 вокруг тебя)
+  const cs = 11, gap = 2, R = 3, ox = W-14-(2*R+1)*(cs+gap), oy = 14;
+  for (let dy=-R; dy<=R; dy++) for (let dx=-R; dx<=R; dx++){
+    const rx = room.rx+dx, ry = room.ry+dy;
+    const vis = visited.has(rx+','+ry);
+    const near = vis || visited.has((rx+1)+','+ry) || visited.has((rx-1)+','+ry) || visited.has(rx+','+(ry+1)) || visited.has(rx+','+(ry-1));
+    if (!near) continue;
+    const info = roomInfo(rx, ry);
+    let col = vis ? '#888' : '#444';
+    if (info.type === 'spawn') col = '#4a90e2';
+    else if (info.type === 'boss') col = vis ? '#d44' : '#833';
+    else if (info.type === 'treasure') col = vis ? '#c9a227' : '#7a6310';
+    if (dx === 0 && dy === 0) col = '#fff';
+    ctx.fillStyle = col;
+    ctx.fillRect(ox + (dx+R)*(cs+gap), oy + (dy+R)*(cs+gap), cs, cs);
+  }
+  ctx.textAlign = 'right'; ctx.fillStyle = '#ffffffcc'; ctx.font = '12px system-ui';
+  ctx.fillText(`комната ${room.rx}, ${room.ry}`, W-14, oy + (2*R+1)*(cs+gap) + 12);
+
+  for (const s in joy){
+    const j = joy[s]; if (!j) continue;
+    const d = Math.hypot(j.x-j.sx, j.y-j.sy) || 1, k = Math.min(1, 55/d);
+    ctx.strokeStyle = '#ffffff55'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(j.sx, j.sy, 55, 0, 7); ctx.stroke();
+    ctx.fillStyle = s === 'aim' ? '#9fd8ff99' : '#ffffff88';
+    ctx.beginPath(); ctx.arc(j.sx + (j.x-j.sx)*k, j.sy + (j.y-j.sy)*k, 24, 0, 7); ctx.fill();
+  }
+  if (msgT > 0){
+    ctx.globalAlpha = Math.min(1, msgT/40);
+    ctx.fillStyle = '#ffd24a'; ctx.font = 'bold 24px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(msg, W/2, H-60);
+    ctx.globalAlpha = 1;
+  }
+  if (state === 'dead'){
+    ctx.fillStyle = '#000000b0'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#ff5a5a'; ctx.font = 'bold 48px system-ui';
+    ctx.fillText('ТЫ ПОГИБ', W/2, H/2-10);
+    ctx.fillStyle = '#ddd'; ctx.font = '18px system-ui';
+    ctx.fillText(isTouch ? 'Тапни, чтобы вернуться на спавн' : 'Нажми R, чтобы вернуться на спавн', W/2, H/2+30);
+  }
+}
+
+let last = performance.now(), acc = 0;
+function loop(t){
+  acc += Math.min(100, t-last); last = t;
+  while (acc >= 16.67){ if (state === 'play' && !paused) update(); acc -= 16.67; frame++; }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
